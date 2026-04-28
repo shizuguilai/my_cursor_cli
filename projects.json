@@ -1,0 +1,13 @@
+{
+  "projects": {
+    "默认项目": {
+      "path": "/root/.openclaw/workspace",
+      "description": "OpenClaw 工作区"
+    },
+    "Cursor 远程控制台": {
+      "path": "/root/.openclaw/workspace/my_cursor_cli",
+      "description": "Cursor 远程控制台项目"
+    }
+  },
+  "default_project": "默认项目"
+}
