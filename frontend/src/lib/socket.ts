@@ -11,18 +11,25 @@ function disconnectIfNeeded() {
 }
 
 export function getSocket(token?: string): Socket {
-  // token 变化时重建连接，避免沿用旧认证信息
-  const nextToken = token ? token : null
+  // 仅在显式传入 token 时更新认证，避免无 token 调用污染当前连接状态
+  const nextToken = typeof token === 'string' ? token : currentToken
+  if (!nextToken) {
+    throw new Error('[Socket] getSocket() requires token on first initialization')
+  }
+
+  console.log('[Socket] getSocket(): nextToken =', nextToken)
   if (!socket || currentToken !== nextToken) {
     disconnectIfNeeded()
     currentToken = nextToken
 
     socket = io({
       path: '/socket.io',
+      autoConnect: false,
       transports: ['polling', 'websocket'],
       reconnectionDelay: 1000,
       reconnectionAttempts: 10,
-      auth: nextToken ? { token: nextToken } : undefined,
+      // 仅使用标准 auth，避免 query/auth 双通道导致后端 auth_keys 抖动
+      auth: { token: nextToken, authorization: nextToken },
     })
 
     socket.on('connect', () => {

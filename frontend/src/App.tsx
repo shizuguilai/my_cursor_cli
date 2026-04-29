@@ -59,6 +59,8 @@ function App() {
   const [connected, setConnected] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const socketRef = useRef<any>(null)
+  const pendingRequestSentAtRef = useRef<Record<string, number>>({})
+  const firstOutputSeenRef = useRef<Record<string, boolean>>({})
 
   const authedFetch = useCallback(async (url: string, options: RequestInit = {}) => {
     const headers = new Headers(options.headers || {})
@@ -72,13 +74,14 @@ function App() {
       const res = await authedFetch('/api/projects')
       const data = await res.json()
       setProjects(data.projects)
-      if (data.projects.length > 0 && !currentProject) {
-        setCurrentProject(data.projects[0])
-      }
+      setCurrentProject(prev => {
+        if (prev) return prev
+        return data.projects.length > 0 ? data.projects[0] : null
+      })
     } catch (e) {
       console.error('加载工作区失败:', e)
     }
-  }, [currentProject, authedFetch])
+  }, [authedFetch])
 
   // 加载会话列表
   const loadSessions = useCallback(async () => {
@@ -117,6 +120,11 @@ function App() {
     }
   }
 
+  // 滚动到底部
+  const scrollToBottom = useCallback(() => {
+    setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50)
+  }, [])
+
   // 选择会话（从后端加载完整历史）
   const selectSession = useCallback(async (session: Session) => {
     if (session.id.startsWith('new-')) {
@@ -124,6 +132,7 @@ function App() {
         ...session,
         messages: [],
       })
+      scrollToBottom()
       return
     }
 
@@ -138,19 +147,16 @@ function App() {
         ...detail,
         messages: detail.messages || [],
       })
+      scrollToBottom()
     } catch (e) {
       console.error('加载会话详情失败:', e)
       setCurrentSession({
         ...session,
         messages: [],
       })
+      scrollToBottom()
     }
-  }, [authedFetch])
-
-  // 滚动到底部
-  const scrollToBottom = useCallback(() => {
-    setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50)
-  }, [])
+  }, [authedFetch, scrollToBottom])
 
   // 发送消息
   const sendMessage = useCallback((prompt: string) => {
@@ -175,11 +181,22 @@ function App() {
     }
     setCurrentSession(prev => prev ? { ...prev, messages: [...prev.messages, userMsg] } : prev)
 
+    const clientSentAt = Date.now()
+    const requestId = `req-${clientSentAt}-${Math.random().toString(36).slice(2, 8)}`
+    pendingRequestSentAtRef.current[requestId] = clientSentAt
+    firstOutputSeenRef.current[requestId] = false
+    console.log(
+      `[sendMessage][client] request_id=${requestId} session_id=${currentSession?.id || 'new'} ` +
+      `prompt_len=${prompt.length} sent_at=${clientSentAt}`
+    )
+
     // 2. 发送时带上 session_id，让后端复用已有会话
     socket.emit('execute', {
       workspace: currentProject.path,
       prompt,
       session_id: currentSession?.id && !currentSession.id.startsWith('new-') ? currentSession.id : undefined,
+      request_id: requestId,
+      client_sent_at: clientSentAt,
     })
     scrollToBottom()
   }, [currentProject, currentSession, scrollToBottom])
@@ -254,19 +271,41 @@ function App() {
     }
   }, [loginToken])
 
-  // 初始化（鉴权通过后）
+  // 初始化数据（鉴权通过后）
   useEffect(() => {
     if (!isAuthenticated || !authToken) return
 
     loadProjects()
     loadSessions()
+  }, [isAuthenticated, authToken, loadProjects, loadSessions])
 
+  // 初始化 socket（鉴权通过后）
+  useEffect(() => {
+    if (!isAuthenticated || !authToken) return
+
+    console.log('[Socket] getSocket called with authToken:', authToken)
     const socket = getSocket(authToken)
     socketRef.current = socket
 
     // 连接状态
-    socket.on('connect', () => setConnected(true))
-    socket.on('disconnect', () => setConnected(false))
+    setConnected(socket.connected)
+    socket.on('connect', () => {
+      console.log('[Socket] App socket.on(connect) -> setConnected(true)')
+      setConnected(true)
+    })
+    socket.on('disconnect', (reason) => {
+      console.log('[Socket] App socket.on(disconnect) -> setConnected(false):', reason)
+      setConnected(false)
+    })
+    socket.on('connect_error', (err) => {
+      console.error('[Socket] App socket.on(connect_error) -> setConnected(false):', err?.message || err)
+      setConnected(false)
+    })
+
+    // 监听器注册完成后再 connect，避免错过首个 connect 事件
+    if (!socket.connected) {
+      socket.connect()
+    }
 
     // 会话列表更新
     socket.on('sessions_update', (data: { sessions: Session[] }) => {
@@ -274,10 +313,28 @@ function App() {
     })
 
     // 开始执行 → 立即用真实 session_id 更新 currentSession
-    socket.on('started', (data: { session_id: string }) => {
+    socket.on('started', (data: { session_id: string; request_id?: string; client_sent_at?: number; server_received_at?: number; server_started_emit_at?: number }) => {
       const realSessionId = data.session_id
+      const now = Date.now()
+      if (data.request_id) {
+        const localSentAt = pendingRequestSentAtRef.current[data.request_id] ?? data.client_sent_at
+        const totalStartLatency = typeof localSentAt === 'number' ? now - localSentAt : -1
+        const clientToServer = (typeof data.server_received_at === 'number' && typeof localSentAt === 'number')
+          ? data.server_received_at - localSentAt
+          : -1
+        const serverQueue = (typeof data.server_started_emit_at === 'number' && typeof data.server_received_at === 'number')
+          ? data.server_started_emit_at - data.server_received_at
+          : -1
+        console.log(
+          `[sendMessage][timing] started request_id=${data.request_id} session_id=${realSessionId} ` +
+          `total_start_ms=${totalStartLatency} client_to_server_ms=${clientToServer} server_queue_ms=${serverQueue}`
+        )
+      }
       setCurrentSession(prev => {
         if (!prev) return prev
+        // 只在“当前会话”确实对应这次 started 时更新 is_running
+        if (!prev.id.startsWith('new-') && prev.id !== realSessionId) return prev
+
         // 如果 currentSession 没有有效 id（new-开头），用真实 id 替换
         const finalId = prev.id.startsWith('new-') ? realSessionId : prev.id
         return { ...prev, id: finalId, is_running: true }
@@ -290,8 +347,21 @@ function App() {
     })
 
     // 流式输出
-    socket.on('output', (data: { session_id: string; type: string; content: string; snippet: string; elapsed: number }) => {
+    socket.on('output', (data: { session_id: string; type: string; content: string; snippet: string; elapsed: number; request_id?: string }) => {
       if (!data.content) return
+      if (data.request_id) {
+        const seen = firstOutputSeenRef.current[data.request_id]
+        if (!seen) {
+          firstOutputSeenRef.current[data.request_id] = true
+          const localSentAt = pendingRequestSentAtRef.current[data.request_id]
+          if (typeof localSentAt === 'number') {
+            console.log(
+              `[sendMessage][timing] first_output request_id=${data.request_id} ` +
+              `session_id=${data.session_id} first_output_ms=${Date.now() - localSentAt} output_type=${data.type}`
+            )
+          }
+        }
+      }
       setCurrentSession(prev => {
         if (!prev) return prev
         // 如果 currentSession 是 new- 开头但 output 带来了真实 id，同步更新
@@ -314,7 +384,18 @@ function App() {
     })
 
     // 执行完成
-    socket.on('done', (data: { session_id: string; result: string; tool_summary: string[] }) => {
+    socket.on('done', (data: { session_id: string; result: string; tool_summary: string[]; request_id?: string }) => {
+      if (data.request_id) {
+        const localSentAt = pendingRequestSentAtRef.current[data.request_id]
+        if (typeof localSentAt === 'number') {
+          console.log(
+            `[sendMessage][timing] done request_id=${data.request_id} ` +
+            `session_id=${data.session_id} total_ms=${Date.now() - localSentAt}`
+          )
+        }
+        delete pendingRequestSentAtRef.current[data.request_id]
+        delete firstOutputSeenRef.current[data.request_id]
+      }
       setCurrentSession(prev => {
         if (!prev) return prev
         if (prev.id !== data.session_id) return prev
@@ -347,17 +428,16 @@ function App() {
     return () => {
       socket.off('connect')
       socket.off('disconnect')
+      socket.off('connect_error')
       socket.off('sessions_update')
       socket.off('started')
       socket.off('output')
       socket.off('done')
       socket.off('error')
       socket.off('killed')
-      socket.disconnect()
-      socketRef.current = null
-      setConnected(false)
+      // 只卸载监听器，不主动断开全局 socket，避免短暂重渲染导致“连接后立即断开”
     }
-  }, [isAuthenticated, authToken, loadProjects, loadSessions, scrollToBottom])
+  }, [isAuthenticated, authToken, scrollToBottom, loadSessions])
 
   if (authChecking) {
     return (

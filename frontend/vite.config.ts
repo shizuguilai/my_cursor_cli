@@ -10,6 +10,8 @@ export default defineConfig({
       '/socket.io': {
         target: 'http://localhost:5000',
         ws: true,
+        // WebSocket 握手可能受 Host/Origin 影响；改写来源可提升兼容性
+        changeOrigin: true,
       },
     },
   },

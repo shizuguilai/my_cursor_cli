@@ -81,37 +81,37 @@ def add_message(
     ts = int(timestamp if timestamp is not None else datetime.now().timestamp() * 1000)
     with _db_lock:
         with _conn() as conn:
-            last_msg = conn.execute(
+            recent_rows = conn.execute(
                 """
-                SELECT id, type
+                SELECT content
                 FROM messages
                 WHERE session_id = ?
                 ORDER BY id DESC
-                LIMIT 1
+                LIMIT 5
                 """,
                 (session_id,),
-            ).fetchone()
+            ).fetchall()
+            recent_contents = {row["content"] for row in recent_rows}
+            print(
+                (
+                    session_id,
+                    msg_type,
+                    content[:30],
+                    [row["content"][:30] for row in recent_rows],
+                ),
+                flush=True,
+            )
 
-            if last_msg and last_msg["type"] == msg_type:
-                conn.execute(
-                    """
-                    UPDATE messages
-                    SET content = content || ?,
-                        snippet = ?,
-                        elapsed = ?,
-                        timestamp = ?
-                    WHERE id = ?
-                    """,
-                    (content, snippet, int(elapsed), ts, last_msg["id"]),
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO messages (session_id, type, content, snippet, elapsed, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (session_id, msg_type, content, snippet, int(elapsed), ts),
-                )
+            if content in recent_contents:
+                return
+
+            conn.execute(
+                """
+                INSERT INTO messages (session_id, type, content, snippet, elapsed, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, msg_type, content, snippet, int(elapsed), ts),
+            )
 
 
 def mark_session_done(session_id: str, result: str) -> None:
@@ -153,6 +153,40 @@ def list_sessions() -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def _merge_stream_fragments(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """合并连续的短 responding 碎片，减少历史消息气泡数量。"""
+    merged: List[Dict[str, Any]] = []
+    buffer: Optional[Dict[str, Any]] = None
+
+    for msg in messages:
+        is_short_responding = (
+            msg["type"] == "responding" and len(msg["content"]) <= 20
+        )
+
+        if is_short_responding:
+            if buffer is None:
+                buffer = dict(msg)
+                continue
+
+            if buffer["type"] == msg["type"]:
+                buffer["content"] += msg["content"]
+                # 保留连续片段中最后一条的时间和耗时，便于反映最终状态
+                buffer["timestamp"] = msg["timestamp"]
+                buffer["elapsed"] = msg["elapsed"]
+                continue
+
+        if buffer is not None:
+            merged.append(buffer)
+            buffer = None
+
+        merged.append(msg)
+
+    if buffer is not None:
+        merged.append(buffer)
+
+    return merged
+
+
 def get_session(session_id: str) -> Optional[Dict[str, Any]]:
     with _db_lock:
         with _conn() as conn:
@@ -177,7 +211,7 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
             ).fetchall()
 
     session = dict(row)
-    session["messages"] = [
+    session_messages = [
         {
             "id": f"{m['session_id']}-{m['id']}",
             "session_id": m["session_id"],
@@ -189,6 +223,7 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         }
         for m in msg_rows
     ]
+    session["messages"] = _merge_stream_fragments(session_messages)
     return session
 
 

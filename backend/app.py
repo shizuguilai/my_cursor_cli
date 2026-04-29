@@ -7,6 +7,7 @@ eventlet.monkey_patch()
 import os
 import sys
 import uuid
+import time
 from datetime import datetime
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -199,20 +200,91 @@ def api_delete_session(session_id):
 
 @socketio.on('connect')
 def on_connect(auth=None):
-    token = None
-    if isinstance(auth, dict):
-        token = auth.get('token')
+    # socket.io-client 的 auth 可能是 dict/str 等；浏览器环境可能与 Node/curl 的握手字段位置不同。
+    # 这里做“尽量多位置兜底提取”，并增加不泄露 token 的可观测日志，便于定位浏览器连接被拒原因。
+    def _redact_token_val(v: object) -> str | None:
+        if v is None:
+            return None
+        s = str(v)
+        return f'(len={len(s)})'
 
+    def _redact_dict(d: dict) -> dict:
+        # 尽量只打印 token/认证相关字段的“长度信息”，避免泄露完整凭证
+        redact_keys = {
+            'token', 'authorization', 'Authorization',
+            'auth', 'authToken', 'access_token',
+            'AuthorizationBearer'
+        }
+        out: dict = {}
+        for k, v in d.items():
+            if any(k == rk or k.lower() == rk.lower() for rk in redact_keys):
+                out[k] = _redact_token_val(v)
+            else:
+                out[k] = v
+        return out
+
+    token = None
+    auth_type = type(auth).__name__
+    auth_keys = list(auth.keys()) if isinstance(auth, dict) else None
+
+    # 1) 优先从 auth 里取（socket.io 标准握手携带）
+    try:
+        if isinstance(auth, dict):
+            for k in ['token', 'authorization', 'Authorization', 'authToken', 'access_token']:
+                if k in auth and auth[k] is not None:
+                    token = str(auth[k]).strip()
+                    if token:
+                        break
+        elif isinstance(auth, str):
+            s = auth.strip()
+            # 兼容：某些情况下 auth 可能是 JSON 字符串
+            if s.startswith('{') and s.endswith('}'):
+                import json
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, dict):
+                        for k in ['token', 'authorization', 'Authorization', 'authToken', 'access_token']:
+                            if k in parsed and parsed[k] is not None:
+                                token = str(parsed[k]).strip()
+                                if token:
+                                    break
+                except Exception:
+                    pass
+            if not token:
+                token = s or None
+    except Exception as e:
+        print(f'[SocketIO] on_connect auth parse ERROR: {e}', flush=True)
+
+    # 2) 再从 query args 里取（浏览器/代理/版本差异时可能不走 auth）
+    if not token:
+        # 常规 token=...，以及可能出现的 auth[token]=... 这种编码后的 key
+        for key in ['token', 'authorization', 'Authorization', 'authToken', 'access_token', 'auth[token]']:
+            v = request.args.get(key)
+            if v:
+                token = v.strip()
+                break
+
+    # 3) 最后兜底：兼容 Authorization Bearer / X-Auth-Token
     if not token:
         token = _extract_token_from_request()
 
+    # 日志：不打印完整 token，只打印“存在性/长度”，以及 query/auth 的结构信息
+    args_dict = request.args.to_dict(flat=True)
+    origin = request.headers.get('Origin') or request.headers.get('origin')
+    print(
+        f'[SocketIO] on_connect sid={getattr(request, "sid", None)} auth_type={auth_type} '
+        f'auth_keys={auth_keys} origin={origin} args={_redact_dict(args_dict)} extracted_token={_redact_token_val(token)}',
+        flush=True
+    )
+
     if not token or token != AUTH_TOKEN:
-        print('[Auth] Socket connect rejected (invalid token)', flush=True)
+        print(
+            f'[Auth] Socket connect rejected: extracted_token={_redact_token_val(token)} expected_token={_redact_token_val(AUTH_TOKEN)}',
+            flush=True
+        )
         return False
 
-    print(f'[SocketIO] 客户端连接: {request.sid}')
-    print(f'[SocketIO] 连接 URL: {request.url}')
-    print(f'[SocketIO] 连接 Headers: {dict(request.headers)}')
+    print(f'[SocketIO] 客户端连接: {request.sid}', flush=True)
 
 
 @socketio.on('disconnect')
@@ -226,11 +298,28 @@ def on_execute(data):
     执行 Cursor Agent 任务
     data: { workspace, prompt, model?, session_id? }
     """
-    print(f'[SocketIO] on_execute 收到数据: {data}')
+    print(f'[SocketIO] on_execute 收到数据: {data}', flush=True)
     workspace = data.get('workspace', '')
     prompt = data.get('prompt', '')
     model = data.get('model', 'auto')
-    session_id = data.get('session_id') or str(uuid.uuid4())[:8]
+    incoming_session_id = data.get('session_id')
+    session_id = incoming_session_id or str(uuid.uuid4())[:8]
+    request_id = data.get('request_id')
+    client_sent_at = data.get('client_sent_at')
+    server_received_at = int(time.time() * 1000)
+    print(
+        f'[SocketIO] execute(sendMessage) sid={getattr(request, "sid", None)} '
+        f'incoming_session_id={incoming_session_id} resolved_session_id={session_id} '
+        f'prompt_len={len(prompt)} model={model} request_id={request_id} '
+        f'client_sent_at={client_sent_at} server_received_at={server_received_at}',
+        flush=True,
+    )
+    if isinstance(client_sent_at, (int, float)):
+        print(
+            f'[SocketIO][Timing] execute request_id={request_id} '
+            f'client_to_server_ms={server_received_at - int(client_sent_at)}',
+            flush=True,
+        )
 
     if not workspace or not prompt:
         emit('error', {'session_id': session_id, 'error': 'workspace 和 prompt 不能为空'})
@@ -244,13 +333,20 @@ def on_execute(data):
     print(f'[Execute] session={session_id} workspace={workspace} prompt={prompt[:50]}...')
 
     # 记录会话和用户消息
+    print(f'[SocketIO] execute upsert_session: session_id={session_id}', flush=True)
     session_store.upsert_session(session_id, workspace, model)
+    print(f'[SocketIO] execute add user message: session_id={session_id}', flush=True)
     session_store.add_message(session_id, 'user', prompt, snippet=prompt[:50], elapsed=0)
 
     # 立即发送 started 事件
+    server_started_emit_at = int(time.time() * 1000)
     emit('started', {
         'session_id': session_id,
         'status': 'started',
+        'request_id': request_id,
+        'client_sent_at': client_sent_at,
+        'server_received_at': server_received_at,
+        'server_started_emit_at': server_started_emit_at,
     })
 
     # 广播会话列表更新
@@ -258,6 +354,7 @@ def on_execute(data):
 
     # 关键：在启动后台任务前抓取 sid，避免跨线程 request context 问题
     sid = request.sid
+    print(f'[SocketIO] execute captured room sid={sid} for session={session_id}', flush=True)
 
     def on_progress(evt):
         """进度回调 - 通过 WebSocket 推送"""
@@ -271,6 +368,7 @@ def on_execute(data):
                 'content': content,
                 'snippet': evt.get('snippet', ''),
                 'elapsed': evt.get('elapsed', 0),
+                'request_id': request_id,
             }, room=sid)
             if content:
                 session_store.add_message(
@@ -293,6 +391,7 @@ def on_execute(data):
             'session_id': evt.get('session_id', session_id),
             'result': evt.get('result', ''),
             'tool_summary': evt.get('tool_summary', []),
+            'request_id': request_id,
         }, room=sid)
         print(f'[Execute] emitted done event for session={evt.get("session_id", session_id)}')
         # 更新会话记录
@@ -306,6 +405,7 @@ def on_execute(data):
         socketio.emit('error', {
             'session_id': session_id,
             'error': error_msg,
+            'request_id': request_id,
         }, room=sid)
         session_store.mark_session_error(session_id, error_msg)
         socketio.emit('sessions_update', {'sessions': _get_sessions_list()}, room=sid)
@@ -329,6 +429,7 @@ def on_execute(data):
             on_error(f'执行异常: {e}')
 
     # socketio.start_background_task 会让回调在 SocketIO 的 greenlet 上下文中运行
+    print(f'[SocketIO] execute start_background_task: session={session_id}', flush=True)
     socketio.start_background_task(run_agent_task)
 
 
