@@ -9,6 +9,7 @@ import subprocess
 import threading
 import uuid
 import time
+import select
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any, List
@@ -21,6 +22,18 @@ PROGRESS_INTERVAL = 2  # 秒
 # 全局活跃任务
 active_agents: Dict[str, 'AgentProcess'] = {}
 _active_lock = threading.Lock()
+
+# 诊断日志文件
+DIAG_LOG = '/tmp/agent_diag.log'
+
+
+def _diag(msg: str):
+    """诊断日志"""
+    ts = time.strftime('%H:%M:%S')
+    line = f"[{ts}] {msg}\n"
+    with open(DIAG_LOG, 'a') as f:
+        f.write(line)
+    print(f'[DIAG] {msg}', flush=True)
 
 
 class AgentProcess:
@@ -102,30 +115,34 @@ def execute(
 ) -> str:
     """
     执行 Cursor Agent 任务
-    
+
     Args:
         workspace: 工作区路径
         prompt: 执行的 prompt
         model: 模型名称
-        session_id: 会话 ID（用于恢复）
-        api_key: API Key（可选）
-        timeout: 超时时间（秒）
+        session_id: 会话 ID(用于恢复)
+        api_key: API Key(可选)
+        timeout: 超时时间(秒)
         on_progress: 进度回调 {session_id, type, content, snippet, elapsed}
         on_done: 完成回调 {session_id, result, session_id}
         on_error: 错误回调 {session_id, error}
-    
+
     Returns:
         session_id
     """
+    # 每次执行清空诊断日志
+    with open(DIAG_LOG, 'w') as f:
+        f.write('')
+
     if not session_id:
         session_id = str(uuid.uuid4())[:8]
-    
+
     workspace_abs = str(Path(workspace).resolve())
-    
+
     # 检查 workspace 是否有效
     if not workspace_abs or workspace_abs == '.' or 'undefined' in workspace_abs.lower():
         raise ValueError(f"Workspace 无效: {workspace}")
-    
+
     # 构建 CLI 参数
     args = [
         AGENT_BIN,
@@ -135,20 +152,20 @@ def execute(
         '--output-format', 'stream-json',
         '--stream-partial-output',
     ]
-    
+
     if session_id:
         args.extend(['--resume', session_id])
-    
+
     args.extend(['--', prompt])
-    
+
     # 构建环境变量
     env = os.environ.copy()
     if api_key:
         env['CURSOR_API_KEY'] = api_key
-    
+
     # 启动进程
-    print(f"[Agent] Spawning: {' '.join(args[:6])}... workspace={workspace_abs}")
-    
+    _diag(f'Spawning: {" ".join(args[:6])}... workspace={workspace_abs}')
+    _diag(f'Full args: {args}')
     try:
         process = subprocess.Popen(
             args,
@@ -157,21 +174,47 @@ def execute(
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             text=False,  # binary mode for JSON streaming
-            bufsize=1,
+            bufsize=0,   # 无缓冲，直接从 pipe 读
         )
     except Exception as e:
         raise RuntimeError(f"Agent 进程启动失败: {e}")
-    
+
+    # 关键修复：eventlet 对 subprocess pipe 有特殊处理问题，
+    # 显式设置 stdout/stderr 为 blocking 模式
+    # Python 3.12+: os.set_blocking(fd, blocking)
+    set_blocking = getattr(os, 'set_blocking', None) or getattr(os, 'set_blocking_fd', None)
+    if set_blocking:
+        try:
+            fd = process.stdout.fileno()
+            old_blocking = os.get_blocking(fd)
+            if not old_blocking:
+                set_blocking(fd, True)
+                _diag(f'set stdout blocking=True (was {old_blocking})')
+        except (AttributeError, OSError) as ex:
+            _diag(f'set_blocking stdout failed: {ex}')
+
+        try:
+            fd = process.stderr.fileno()
+            old_blocking = os.get_blocking(fd)
+            if not old_blocking:
+                set_blocking(fd, True)
+                _diag(f'set stderr blocking=True (was {old_blocking})')
+        except (AttributeError, OSError) as ex:
+            _diag(f'set_blocking stderr failed: {ex}')
+
     if not process.pid:
         raise RuntimeError("Agent 进程启动失败: pid 为空")
-    
+
     pid = process.pid
-    
+
     # 注册活跃任务
     agent = AgentProcess(session_id, pid, process, workspace_abs, time.time())
     with _active_lock:
         active_agents[session_id] = agent
-    
+
+    _diag(f'Subprocess started pid={pid} session={session_id} stdout_fileno={process.stdout.fileno()} stderr_fileno={process.stderr.fileno()}')
+
+    # 用 select 配合 readline 实现高效读取，避免逐字节 read(1) 的低效问题
     def read_stdout():
         line_buf = b''
         assistant_buf = ''
@@ -181,48 +224,78 @@ def execute(
         last_output_time = time.time()
         timeout_timer = time.time() + timeout
         session_id_from_cli = session_id
-        
+
+        _diag('read_stdout thread started')
+
         try:
             while True:
                 if agent.done or agent.manually_killed:
+                    _diag(f'breaking: done={agent.done} manually_killed={agent.manually_killed}')
                     break
-                
+
                 # 检查超时
                 if time.time() > timeout_timer:
-                    print(f"[Agent] 超时终止 ({timeout}s) session={session_id}")
+                    _diag(f'TIMEOUT ({timeout}s) session={session_id}')
                     agent.kill()
                     if on_error:
-                        on_error(f"Agent 运行超时 ({timeout // 60}分钟)，已强制终止")
+                        on_error(f"Agent 运行超时 ({timeout // 60}分钟),已强制终止")
                     break
-                
-                # 读取一行
-                char = process.stdout.read(1)
+
+                # 使用 select.select 等待数据（eventlet 下 poll 不可用，用 select 代替）
+                try:
+                    ready, _, _ = select.select([process.stdout], [], [], 1.0)
+                except OSError as e:
+                    _diag(f'select.select OSError: {e}')
+                    break
+
+                if not ready:
+                    # select 超时，检测空闲
+                    idle_time = time.time() - last_output_time
+                    if idle_time > 300 and not agent.done:
+                        _diag(f'{idle_time/60:.0f}分钟无输出,强制终止 session={session_id}')
+                        agent.kill()
+                        if on_error:
+                            on_error(f"任务 {idle_time/60:.0f}分钟无响应,已强制终止。可能原因:等待外部服务响应、陷入死循环或卡在用户输入")
+                    continue
+
+                # 有数据可读，尝试读一行
+                try:
+                    char = os.read(process.stdout.fileno(), 4096)
+                except OSError as e:
+                    _diag(f'os.read OSError: {e}')
+                    break
+
                 if not char:
-                    # 进程结束
+                    _diag('stdout EOF (no char returned)')
                     break
-                
+
+                _diag(f'read {len(char)} bytes from stdout')
+
+                # 追加到行缓冲区并提取完整行
                 line_buf += char
-                if char == b'\n':
-                    line = line_buf.decode('utf-8', errors='replace').strip()
-                    line_buf = b''
-                    
+                while b'\n' in line_buf:
+                    line, line_buf = line_buf.split(b'\n', 1)
+                    line = line.decode('utf-8', errors='replace').strip()
                     if not line:
                         continue
-                    
+
                     last_output_time = time.time()
-                    
+                    _diag(f'line: {line[:120]}')
+
                     # 解析 JSON
                     try:
                         ev = json.loads(line)
                     except json.JSONDecodeError:
+                        _diag(f'JSON parse failed: {line[:80]}')
                         continue
-                    
+
                     ev_type = ev.get('type', '')
-                    
-                    if ev_type == 'session_id':
+
+                    if ev_type == 'init':
                         session_id_from_cli = ev.get('session_id', session_id)
+                        _diag(f'got init, session_id={session_id_from_cli}')
                         continue
-                    
+
                     # 确定阶段
                     if ev_type == 'thinking':
                         phase = 'thinking'
@@ -251,72 +324,145 @@ def execute(
                         content = f"[工具调用] {tool_name}" if tool_name else "[工具调用]"
                     else:
                         content = ''
-                    
+
                     # 回调进度
                     if on_progress and phase:
+                        _diag(f'on_progress phase={phase} content={repr(content[:80]) if content else ""}')
                         elapsed = int(time.time() - agent.start_time)
                         # 获取最后几行作为 snippet
                         lines = [l.strip() for l in assistant_buf.split('\n') if l.strip()]
                         snippet = '\n'.join(lines[-4:]) if lines else ''
-                        on_progress({
-                            'session_id': session_id_from_cli,
-                            'type': phase,
-                            'content': content,
-                            'snippet': snippet,
-                            'elapsed': elapsed,
-                        })
-                    
+                        try:
+                            on_progress({
+                                'session_id': session_id_from_cli,
+                                'type': phase,
+                                'content': content,
+                                'snippet': snippet,
+                                'elapsed': elapsed,
+                            })
+                            _diag(f'on_progress called OK')
+                        except Exception as e:
+                            _diag(f'on_progress exception: {e}')
+
                     # 处理 result
                     if ev_type == 'result':
+                        _diag(f'got result: subtype={ev.get("subtype")} result={repr(str(ev.get("result", ""))[:100])}')
                         result_text = ev.get('result', '')
                         if isinstance(result_text, str):
                             result_text = result_text.strip()
                         else:
                             result_text = str(result_text)
-                        
+
                         if ev.get('subtype') == 'error':
                             if on_error:
                                 on_error(result_text)
                         else:
                             final_output = result_text or last_segment.strip() or assistant_buf.strip()
                             if on_done:
-                                on_done({
-                                    'session_id': session_id_from_cli,
-                                    'result': final_output,
-                                    'tool_summary': tool_summary,
-                                })
+                                try:
+                                    on_done({
+                                        'session_id': session_id_from_cli,
+                                        'result': final_output,
+                                        'tool_summary': tool_summary,
+                                    })
+                                    _diag('on_done called OK')
+                                except Exception as e:
+                                    _diag(f'on_done exception: {e}')
                         agent.done = True
                         break
-                
-                # 无输出超时检测（5分钟无输出）
-                idle_time = time.time() - last_output_time
-                if idle_time > 300 and not agent.done:
-                    print(f"[Agent] {idle_time/60:.0f}分钟无输出，强制终止 session={session_id}")
-                    agent.kill()
-                    if on_error:
-                        on_error(f"任务 {idle_time/60:.0f}分钟无响应，已强制终止。可能原因：等待外部服务响应、陷入死循环或卡在用户输入")
-                    break
+
         except Exception as e:
-            print(f"[Agent] stdout 读取异常: {e}")
+            _diag(f'stdout 读取异常: {e}')
             agent.kill()
             if on_error:
                 on_error(str(e))
         finally:
+            _diag('read_stdout exiting')
             # 进程结束
             agent.done = True
             with _active_lock:
                 if session_id in active_agents:
                     del active_agents[session_id]
-            
+
             # 确保进程已终止
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
+                _diag('process.kill() called')
                 process.kill()
-    
+
     thread = threading.Thread(target=read_stdout, daemon=True)
     thread.start()
-    
+
+    # 如果进程在启动后短时间内退出（说明立即失败了），
+    # read_stdout 可能来不及检测。需要额外检查。
+    def check_early_exit():
+        time.sleep(3)  # 等待 3 秒
+        if agent.done:
+            return  # 已经正常结束了
+        poll_result = process.poll()
+        if poll_result is not None:
+            # 进程已经退出但 agent.done 还为 False（还没有通过 read_stdout 检测到退出）
+            _diag(f'Process exited early with code={poll_result}')
+            # 读取 stderr 获取错误信息
+            try:
+                stderr_data = process.stderr.read()
+                if stderr_data:
+                    stderr_text = stderr_data.decode('utf-8', errors='replace').strip()
+                    _diag(f'Early exit stderr: {stderr_text[:500]}')
+                    if on_error and stderr_text:
+                        on_error(stderr_text)
+            except Exception as e:
+                _diag(f'read early stderr failed: {e}')
+            agent.done = True
+
+    early_check_thread = threading.Thread(target=check_early_exit, daemon=True)
+    early_check_thread.start()
+
+    # 启动 stderr 读取线程（防止 pipe 阻塞）
+    def read_stderr():
+        _diag('read_stderr thread started')
+        try:
+            buf = b''
+            while True:
+                try:
+                    ready, _, _ = select.select([process.stderr], [], [], 1.0)
+                except OSError:
+                    break
+                if not ready:
+                    # 检查进程是否结束
+                    if process.poll() is not None:
+                        # 读取剩余数据
+                        remaining = process.stderr.read()
+                        if remaining:
+                            for line in remaining.decode('utf-8', errors='replace').split('\n'):
+                                if line.strip():
+                                    _diag(f'[stderr] {line}')
+                        break
+                    continue
+                try:
+                    data = os.read(process.stderr.fileno(), 2048)
+                except OSError:
+                    break
+                if not data:
+                    break
+                buf += data
+                # 按行输出
+                while b'\n' in buf:
+                    line, buf = buf.split(b'\n', 1)
+                    _diag(f'[stderr] {line.decode("utf-8", errors="replace")}')
+                # 处理最后没有换行符的
+                if buf:
+                    _diag(f'[stderr] {buf.decode("utf-8", errors="replace")}')
+        except Exception as e:
+            _diag(f'read_stderr exception: {e}')
+        finally:
+            _diag('read_stderr thread exiting')
+
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stderr_thread.start()
+
+    _diag(f'Agent.started pid={pid} session={session_id}')
     return session_id
 
 
@@ -324,10 +470,10 @@ def describe_tool_call(tool_call: dict) -> str:
     """工具调用描述"""
     if not tool_call:
         return "未知工具"
-    
+
     name = list(tool_call.keys())[0] if tool_call else '未知工具'
     args = tool_call.get(name, {}) if isinstance(tool_call, dict) else {}
-    
+
     if name == 'Shell':
         cmd = args.get('command', '') if isinstance(args, dict) else ''
         return f"执行命令: {cmd[:80]}"

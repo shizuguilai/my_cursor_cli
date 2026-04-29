@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+.pnp
+.pnp.js
+*.log
+
+# Build
+backend/static/assets/
+!backend/static/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.pyc
+.env
+*.pyc
+__pycache__/
+backend/static/
