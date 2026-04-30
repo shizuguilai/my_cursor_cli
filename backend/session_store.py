@@ -196,26 +196,35 @@ def list_sessions() -> List[Dict[str, Any]]:
 
 
 def _merge_stream_fragments(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """合并连续的短 responding 碎片，减少历史消息气泡数量。"""
+    """合并连续的 responding 碎片，减少历史消息气泡数量。"""
     merged: List[Dict[str, Any]] = []
     buffer: Optional[Dict[str, Any]] = None
 
     for msg in messages:
-        is_short_responding = (
-            msg["type"] == "responding" and len(msg["content"]) <= 20
-        )
-
-        if is_short_responding:
+        if msg["type"] == "responding":
             if buffer is None:
                 buffer = dict(msg)
                 continue
 
-            if buffer["type"] == msg["type"]:
+            # 流式输出结束后有时会补一条完整文本：
+            # 1) 若新片段已在尾部，跳过追加；
+            # 2) 若新片段本身包含已有内容（通常是完整版），用新内容覆盖。
+            if msg["content"].endswith(buffer["content"]):
+                buffer["content"] = msg["content"]
+            elif (
+                len(msg["content"]) > len(buffer["content"])
+                and len(msg["content"]) >= 6
+                and len(buffer["content"]) >= 6
+                and msg["content"][-6:] == buffer["content"][-6:]
+            ):
+                # 某些流式碎片可能缺字符；若新消息更长且尾部一致，优先采用新消息
+                buffer["content"] = msg["content"]
+            elif not buffer["content"].endswith(msg["content"]):
                 buffer["content"] += msg["content"]
-                # 保留连续片段中最后一条的时间和耗时，便于反映最终状态
-                buffer["timestamp"] = msg["timestamp"]
-                buffer["elapsed"] = msg["elapsed"]
-                continue
+            # 保留连续片段中最后一条的时间和耗时，便于反映最终状态
+            buffer["timestamp"] = msg["timestamp"]
+            buffer["elapsed"] = msg["elapsed"]
+            continue
 
         if buffer is not None:
             merged.append(buffer)

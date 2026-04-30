@@ -418,7 +418,7 @@ function App() {
         if (prev.id !== data.session_id) return prev
         const now = Date.now()
         const existingActive = prev.messages.length > 0 ? prev.messages[prev.messages.length - 1] : null
-        const canMerge = existingActive && existingActive.type === data.type && prev.is_running && existingActive.id && !existingActive.id.startsWith('user-')
+        const canMerge = existingActive && existingActive.type === data.type
         if (canMerge) {
           const updated = [...prev.messages]
           updated[updated.length - 1] = { ...updated[updated.length - 1], content: data.content, snippet: data.snippet, elapsed: data.elapsed, timestamp: now }
