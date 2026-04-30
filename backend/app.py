@@ -8,6 +8,7 @@ import os
 import sys
 import uuid
 import time
+import subprocess
 from datetime import datetime
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -16,7 +17,7 @@ from flask_socketio import SocketIO, emit, disconnect
 # 添加 backend 目录到 path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from agent import execute, kill_agent, get_active_agents
+from agent import execute, kill_agent, get_active_agents, AGENT_BIN
 import projects
 import session_store
 
@@ -97,6 +98,58 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), 'static')
 
 # 默认超时 30 分钟
 DEFAULT_TIMEOUT = 30 * 60
+NAME_MAX_LEN = 20
+PENDING_SESSION_NAME = "正在生成会话名称..."
+
+
+def _normalize_session_name(name: str) -> str:
+    cleaned = " ".join((name or "").split()).strip()
+    if not cleaned:
+        return "新会话"
+    return cleaned[:NAME_MAX_LEN]
+
+
+def _generate_session_name(workspace: str, user_prompt: str, model: str) -> str:
+    prompt = (user_prompt or "").strip()
+    if not prompt:
+        return "新会话"
+
+    summary_prompt = (
+        "请根据用户需求生成一个简短中文会话标题。\n"
+        f"要求：不超过{NAME_MAX_LEN}个字，只输出标题本身，不要标点和解释。\n"
+        f"用户需求：{prompt}"
+    )
+    args = [
+        AGENT_BIN,
+        "-p",
+        "--force",
+        "--trust",
+        "--approve-mcps",
+        "--workspace",
+        workspace,
+        "--model",
+        model or "auto",
+        "--output-format",
+        "text",
+        "--",
+        summary_prompt,
+    ]
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        raw = (result.stdout or "").strip()
+        if not raw:
+            return "新会话"
+        candidate = raw.splitlines()[-1].strip().strip('"').strip("'")
+        return _normalize_session_name(candidate)
+    except Exception as e:
+        print(f"[SessionName] generate failed: {e}", flush=True)
+        return "新会话"
 
 @app.route('/')
 def index():
@@ -184,6 +237,19 @@ def api_get_session(session_id):
     active = get_active_agents()
     session['is_running'] = any(a['session_id'] == session_id for a in active)
     return jsonify(session)
+
+
+@app.route('/api/sessions/<session_id>', methods=['PATCH'])
+def api_patch_session(session_id):
+    """更新会话信息（当前支持 name）"""
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'name 不能为空'}), 400
+    ok = session_store.update_session_name(session_id, _normalize_session_name(name))
+    if not ok:
+        return jsonify({'error': '会话不存在'}), 404
+    return jsonify({'ok': True})
 
 
 @app.route('/api/sessions/<session_id>', methods=['DELETE'])
@@ -335,6 +401,8 @@ def on_execute(data):
     # 记录会话和用户消息
     print(f'[SocketIO] execute upsert_session: session_id={session_id}', flush=True)
     session_store.upsert_session(session_id, workspace, model)
+    if not incoming_session_id:
+        session_store.update_session_name(session_id, PENDING_SESSION_NAME)
     print(f'[SocketIO] execute add user message: session_id={session_id}', flush=True)
     session_store.add_message(session_id, 'user', prompt, snippet=prompt[:50], elapsed=0)
 
@@ -349,12 +417,23 @@ def on_execute(data):
         'server_started_emit_at': server_started_emit_at,
     })
 
-    # 广播会话列表更新
-    emit('sessions_update', {'sessions': _get_sessions_list()})
-
     # 关键：在启动后台任务前抓取 sid，避免跨线程 request context 问题
     sid = request.sid
     print(f'[SocketIO] execute captured room sid={sid} for session={session_id}', flush=True)
+
+    # 广播会话列表更新
+    emit('sessions_update', {'sessions': _get_sessions_list()})
+
+    if not incoming_session_id:
+        def resolve_session_name():
+            try:
+                auto_name = _generate_session_name(workspace, prompt, model)
+                session_store.update_session_name(session_id, auto_name)
+                socketio.emit('sessions_update', {'sessions': _get_sessions_list()}, room=sid)
+            except Exception as e:
+                print(f'[SessionName] async resolve failed: {e}', flush=True)
+
+        socketio.start_background_task(resolve_session_name)
 
     def on_progress(evt):
         """进度回调 - 通过 WebSocket 推送"""
@@ -455,6 +534,7 @@ def _get_sessions_list():
             'id': sid,
             'workspace': sess.get('workspace', ''),
             'model': sess.get('model', ''),
+            'name': sess.get('name', '新会话'),
             'created_at': sess.get('created_at', ''),
             'is_running': is_running,
         })

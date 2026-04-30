@@ -28,6 +28,7 @@ def init_db() -> None:
                     id TEXT PRIMARY KEY,
                     workspace TEXT NOT NULL,
                     model TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '新会话',
                     created_at TEXT NOT NULL,
                     completed_at TEXT,
                     result TEXT,
@@ -35,6 +36,12 @@ def init_db() -> None:
                 )
                 """
             )
+            columns = conn.execute("PRAGMA table_info(sessions)").fetchall()
+            column_names = {col["name"] for col in columns}
+            if "name" not in column_names:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN name TEXT NOT NULL DEFAULT '新会话'"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS messages (
@@ -60,8 +67,8 @@ def upsert_session(session_id: str, workspace: str, model: str) -> None:
         with _conn() as conn:
             conn.execute(
                 """
-                INSERT INTO sessions (id, workspace, model, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO sessions (id, workspace, model, name, created_at)
+                VALUES (?, ?, ?, '新会话', ?)
                 ON CONFLICT(id) DO UPDATE SET
                     workspace = excluded.workspace,
                     model = excluded.model
@@ -140,12 +147,47 @@ def mark_session_error(session_id: str, error_msg: str) -> None:
             )
 
 
+def update_session_name(session_id: str, name: str) -> bool:
+    trimmed = (name or "").strip()
+    if not trimmed:
+        return False
+    with _db_lock:
+        with _conn() as conn:
+            result = conn.execute(
+                """
+                UPDATE sessions
+                SET name = ?
+                WHERE id = ?
+                """,
+                (trimmed[:50], session_id),
+            )
+    return result.rowcount > 0
+
+
+def ensure_session_name(session_id: str, name: str) -> bool:
+    trimmed = (name or "").strip()
+    if not trimmed:
+        return False
+    with _db_lock:
+        with _conn() as conn:
+            result = conn.execute(
+                """
+                UPDATE sessions
+                SET name = ?
+                WHERE id = ?
+                  AND (name IS NULL OR TRIM(name) = '' OR name = '新会话')
+                """,
+                (trimmed[:50], session_id),
+            )
+    return result.rowcount > 0
+
+
 def list_sessions() -> List[Dict[str, Any]]:
     with _db_lock:
         with _conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, workspace, model, created_at, completed_at, result, error
+                SELECT id, workspace, model, name, created_at, completed_at, result, error
                 FROM sessions
                 ORDER BY datetime(created_at) DESC
                 """
@@ -192,7 +234,7 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         with _conn() as conn:
             row = conn.execute(
                 """
-                SELECT id, workspace, model, created_at, completed_at, result, error
+                SELECT id, workspace, model, name, created_at, completed_at, result, error
                 FROM sessions
                 WHERE id = ?
                 """,

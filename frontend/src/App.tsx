@@ -9,6 +9,7 @@ export interface Session {
   id: string
   workspace: string
   model: string
+  name?: string
   created_at: string
   is_running: boolean
   result?: string
@@ -169,24 +170,50 @@ function App() {
       console.warn('[Socket] Cannot send: socket not connected')
       return
     }
+    const isNewSession = !currentSession || currentSession.id.startsWith('new-')
+    let targetSessionId = currentSession?.id || ''
+    let nextMessages = currentSession?.messages || []
+
+    if (isNewSession) {
+      const tempSessionId = currentSession?.id?.startsWith('new-') ? currentSession.id : `new-${Date.now()}`
+      const optimisticSession: Session = {
+        id: tempSessionId,
+        workspace: currentProject.path,
+        model: '',
+        name: '正在生成会话名称...',
+        created_at: new Date().toISOString(),
+        is_running: true,
+      }
+      targetSessionId = tempSessionId
+      setSessions((prev) => {
+        const filtered = prev.filter((s) => s.id !== tempSessionId)
+        return [optimisticSession, ...filtered]
+      })
+      setCurrentSession({
+        ...optimisticSession,
+        messages: currentSession?.messages || [],
+      })
+      nextMessages = currentSession?.messages || []
+    }
+
     // 1. 先把用户消息加入气泡显示
     const userMsg: OutputMessage = {
       id: `user-${Date.now()}`,
-      session_id: currentSession?.id || '',
+      session_id: targetSessionId,
       type: 'user',
       content: prompt,
       snippet: prompt.slice(0, 50),
       elapsed: 0,
       timestamp: Date.now(),
     }
-    setCurrentSession(prev => prev ? { ...prev, messages: [...prev.messages, userMsg] } : prev)
+    setCurrentSession(prev => prev ? { ...prev, messages: [...(prev.messages || nextMessages), userMsg] } : prev)
 
     const clientSentAt = Date.now()
     const requestId = `req-${clientSentAt}-${Math.random().toString(36).slice(2, 8)}`
     pendingRequestSentAtRef.current[requestId] = clientSentAt
     firstOutputSeenRef.current[requestId] = false
     console.log(
-      `[sendMessage][client] request_id=${requestId} session_id=${currentSession?.id || 'new'} ` +
+      `[sendMessage][client] request_id=${requestId} session_id=${targetSessionId || 'new'} ` +
       `prompt_len=${prompt.length} sent_at=${clientSentAt}`
     )
 
@@ -198,8 +225,9 @@ function App() {
       request_id: requestId,
       client_sent_at: clientSentAt,
     })
+    loadSessions()
     scrollToBottom()
-  }, [currentProject, currentSession, scrollToBottom])
+  }, [currentProject, currentSession, loadSessions, scrollToBottom])
 
   // 终止任务
   const killSession = useCallback((sessionId: string) => {
@@ -222,6 +250,26 @@ function App() {
       console.error('删除会话失败:', e)
     }
   }, [loadSessions, authedFetch])
+
+  const renameSession = useCallback(async (sessionId: string, name: string) => {
+    const nextName = name.trim()
+    if (!nextName) return
+    try {
+      const res = await authedFetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: nextName }),
+      })
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`)
+      }
+      setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, name: nextName } : s)))
+      setCurrentSession((prev) => (prev?.id === sessionId ? { ...prev, name: nextName } : prev))
+      await loadSessions()
+    } catch (e) {
+      console.error('重命名会话失败:', e)
+    }
+  }, [authedFetch, loadSessions])
 
   // 首次启动：读取本地 token 并校验
   useEffect(() => {
@@ -519,6 +567,7 @@ function App() {
                       id: `new-${Date.now()}`,
                       workspace: currentProject.path,
                       model: '',
+                      name: '新会话',
                       created_at: new Date().toISOString(),
                       is_running: false,
                     }
@@ -537,6 +586,7 @@ function App() {
               onSelect={(s) => selectSession(s)}
               onKill={killSession}
               onDelete={deleteSession}
+              onRename={renameSession}
             />
           </aside>
         )}
