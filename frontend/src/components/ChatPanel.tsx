@@ -1,4 +1,4 @@
-import { useState, useRef, type KeyboardEvent, type RefObject } from 'react'
+import { useState, useRef, useEffect, type KeyboardEvent, type RefObject } from 'react'
 import { Send, Square, Loader2 } from 'lucide-react'
 import type { SessionDetail } from '../App'
 
@@ -119,6 +119,17 @@ export default function ChatPanel({ session, onSend, onKill, messagesEndRef }: P
 }
 
 function MessageBubble({ message }: { message: SessionDetail['messages'][0] }) {
+  const respondingContentRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (message.type !== 'responding') return
+    const el = respondingContentRef.current
+    if (!el) return
+    // 防覆盖：DOM 直写模式下（data-dom-typed=1）React re-render 不应回写旧 state 内容。
+    if (el.getAttribute('data-dom-typed') === '1') return
+    el.textContent = message.content || message.snippet || '...'
+  }, [message.type, message.id, message.content, message.snippet])
+
   const typeStyles: Record<string, string> = {
     thinking: 'border-l-2 border-yellow-600 bg-yellow-900/10',
     tool_call: 'border-l-2 border-blue-600 bg-blue-900/10',
@@ -138,7 +149,7 @@ function MessageBubble({ message }: { message: SessionDetail['messages'][0] }) {
   }
 
   return (
-    <div className={`rounded p-3 ${typeStyles[message.type] || ''}`}>
+    <div className={`rounded p-3 ${typeStyles[message.type] || ''}`} data-message-id={message.id}>
       <div className="flex items-center gap-2 mb-1">
         <span className={`text-xs font-medium ${typeColors[message.type] || 'text-white'}`}>
           {typeLabels[message.type] || '消息'}
@@ -147,9 +158,18 @@ function MessageBubble({ message }: { message: SessionDetail['messages'][0] }) {
           <span className="text-xs text-[#858585]">{formatElapsed(message.elapsed)}</span>
         )}
       </div>
-      <div className="text-sm text-[#d4d4d4] font-mono whitespace-pre-wrap break-words">
-        {message.content || message.snippet || '...'}
-      </div>
+      {message.type === 'responding' ? (
+        <div
+          ref={respondingContentRef}
+          className="text-sm text-[#d4d4d4] font-mono whitespace-pre-wrap break-words"
+          data-message-content-id={message.id}
+          suppressHydrationWarning
+        />
+      ) : (
+        <div className="text-sm text-[#d4d4d4] font-mono whitespace-pre-wrap break-words">
+          {message.content || message.snippet || '...'}
+        </div>
+      )}
     </div>
   )
 }

@@ -62,6 +62,13 @@ function App() {
   const socketRef = useRef<any>(null)
   const pendingRequestSentAtRef = useRef<Record<string, number>>({})
   const firstOutputSeenRef = useRef<Record<string, boolean>>({})
+  const activeRespondingMessageIdRef = useRef<Record<string, string>>({})
+  const streamingRespondingMessageIdRef = useRef<Record<string, string>>({})
+  const typingTimeoutRef = useRef<number | null>(null)
+  const [displayQueue, setDisplayQueue] = useState('')
+  const [displayMessageId, setDisplayMessageId] = useState<string | null>(null)
+  const doneReceivedRef = useRef<Record<string, boolean>>({})
+
 
   const authedFetch = useCallback(async (url: string, options: RequestInit = {}) => {
     const headers = new Headers(options.headers || {})
@@ -212,6 +219,8 @@ function App() {
     const requestId = `req-${clientSentAt}-${Math.random().toString(36).slice(2, 8)}`
     pendingRequestSentAtRef.current[requestId] = clientSentAt
     firstOutputSeenRef.current[requestId] = false
+    // Reset done flag so output events are processed for this request
+    if (targetSessionId) doneReceivedRef.current[targetSessionId] = false
     console.log(
       `[sendMessage][client] request_id=${requestId} session_id=${targetSessionId || 'new'} ` +
       `prompt_len=${prompt.length} sent_at=${clientSentAt}`
@@ -234,6 +243,30 @@ function App() {
     const socket = socketRef.current
     socket?.emit('kill', { session_id: sessionId })
   }, [])
+
+  useEffect(() => {
+    if (!displayMessageId || displayQueue.length === 0) return
+    typingTimeoutRef.current = window.setTimeout(() => {
+      const nextChar = displayQueue[0]
+      setCurrentSession(prev => {
+        if (!prev) return prev
+        const idx = prev.messages.findIndex((m) => m.id === displayMessageId)
+        if (idx < 0) return prev
+        const updated = [...prev.messages]
+        const target = updated[idx]
+        updated[idx] = { ...target, content: `${target.content}${nextChar}` }
+        return { ...prev, messages: updated }
+      })
+      setDisplayQueue(prev => prev.slice(1))
+      scrollToBottom()
+    }, 30)
+    return () => {
+      if (typingTimeoutRef.current !== null) {
+        window.clearTimeout(typingTimeoutRef.current)
+        typingTimeoutRef.current = null
+      }
+    }
+  }, [displayQueue, displayMessageId, scrollToBottom])
 
   // 删除会话
   const deleteSession = useCallback(async (sessionId: string) => {
@@ -270,6 +303,8 @@ function App() {
       console.error('重命名会话失败:', e)
     }
   }, [authedFetch, loadSessions])
+
+
 
   // 首次启动：读取本地 token 并校验
   useEffect(() => {
@@ -373,6 +408,7 @@ function App() {
         const serverQueue = (typeof data.server_started_emit_at === 'number' && typeof data.server_received_at === 'number')
           ? data.server_started_emit_at - data.server_received_at
           : -1
+        doneReceivedRef.current[realSessionId] = false
         console.log(
           `[sendMessage][timing] started request_id=${data.request_id} session_id=${realSessionId} ` +
           `total_start_ms=${totalStartLatency} client_to_server_ms=${clientToServer} server_queue_ms=${serverQueue}`
@@ -395,8 +431,12 @@ function App() {
     })
 
     // 流式输出
-    socket.on('output', (data: { session_id: string; type: string; content: string; snippet: string; elapsed: number; request_id?: string }) => {
-      if (!data.content) return
+    socket.on('output', (data: { session_id: string; type: string; content: string; delta?: string; snippet: string; elapsed: number; request_id?: string }) => {
+      const incomingText = data.delta ?? data.content
+      if (!incomingText) return
+      // done 之后不再处理 output，避免覆盖 done.result 的权威内容
+      // done 之后不再处理任何 output，避免末尾空 content 创建重复气泡
+      if (doneReceivedRef.current[data.session_id]) return
       if (data.request_id) {
         const seen = firstOutputSeenRef.current[data.request_id]
         if (!seen) {
@@ -410,6 +450,32 @@ function App() {
           }
         }
       }
+      if (data.type === 'responding') {
+        const messageId = activeRespondingMessageIdRef.current[data.session_id] || `${data.session_id}-responding`
+        activeRespondingMessageIdRef.current[data.session_id] = messageId
+        streamingRespondingMessageIdRef.current[data.session_id] = messageId
+        setDisplayMessageId(messageId)
+        setDisplayQueue((prev) => prev + incomingText)
+        setCurrentSession(prev => {
+          if (!prev) return prev
+          const targetId = prev.id.startsWith('new-') ? data.session_id : prev.id
+          if (targetId !== data.session_id) return prev
+          const existingIdx = prev.messages.findIndex((m) => m.id === messageId)
+          if (existingIdx >= 0) return prev
+          const now = Date.now()
+          const newMsg: OutputMessage = {
+            id: messageId,
+            session_id: data.session_id,
+            type: 'responding',
+            content: '',
+            snippet: '',
+            elapsed: data.elapsed,
+            timestamp: now,
+          }
+          return { ...prev, id: targetId, messages: [...prev.messages, newMsg] }
+        })
+        return
+      }
       setCurrentSession(prev => {
         if (!prev) return prev
         // 如果 currentSession 是 new- 开头但 output 带来了真实 id，同步更新
@@ -421,10 +487,14 @@ function App() {
         const canMerge = existingActive && existingActive.type === data.type
         if (canMerge) {
           const updated = [...prev.messages]
-          updated[updated.length - 1] = { ...updated[updated.length - 1], content: data.content, snippet: data.snippet, elapsed: data.elapsed, timestamp: now }
+          const previous = updated[updated.length - 1]
+          const nextContent = data.type === 'responding'
+            ? `${previous.content}${incomingText}`
+            : incomingText
+          updated[updated.length - 1] = { ...previous, content: nextContent, snippet: data.snippet, elapsed: data.elapsed, timestamp: now }
           return { ...prev, messages: updated }
         } else {
-          const newMsg: OutputMessage = { id: `${data.session_id}-${now}`, session_id: data.session_id, type: data.type as any, content: data.content, snippet: data.snippet, elapsed: data.elapsed, timestamp: now }
+          const newMsg: OutputMessage = { id: `${data.session_id}-${now}`, session_id: data.session_id, type: data.type as any, content: incomingText, snippet: data.snippet, elapsed: data.elapsed, timestamp: now }
           return { ...prev, messages: [...prev.messages, newMsg] }
         }
       })
@@ -433,6 +503,7 @@ function App() {
 
     // 执行完成
     socket.on('done', (data: { session_id: string; result: string; tool_summary: string[]; request_id?: string }) => {
+      doneReceivedRef.current[data.session_id] = true
       if (data.request_id) {
         const localSentAt = pendingRequestSentAtRef.current[data.request_id]
         if (typeof localSentAt === 'number') {
@@ -444,17 +515,36 @@ function App() {
         delete pendingRequestSentAtRef.current[data.request_id]
         delete firstOutputSeenRef.current[data.request_id]
       }
+      // done.result 是权威完整内容，直接覆盖打字机缓冲
+      const messageId = streamingRespondingMessageIdRef.current[data.session_id]
+      if (messageId) {
+        setDisplayQueue('')
+        setDisplayMessageId((prev) => (prev === messageId ? null : prev))
+      }
+      // 再更新 React state（触发一次 re-render，DOM 已有正确内容不受影响）
       setCurrentSession(prev => {
         if (!prev) return prev
         if (prev.id !== data.session_id) return prev
-        return { ...prev, is_running: false, result: data.result }
+        const messages = prev.messages.map(m =>
+          m.id === messageId ? { ...m, content: data.result } : m
+        )
+        return { ...prev, is_running: false, result: data.result, messages }
       })
+      delete activeRespondingMessageIdRef.current[data.session_id]
+      delete streamingRespondingMessageIdRef.current[data.session_id]
       loadSessions()
       scrollToBottom()
     })
 
     // 错误
     socket.on('error', (data: { session_id: string; error: string }) => {
+      const messageId = streamingRespondingMessageIdRef.current[data.session_id]
+      if (messageId) {
+        setDisplayQueue('')
+        setDisplayMessageId((prev) => (prev === messageId ? null : prev))
+      }
+      delete activeRespondingMessageIdRef.current[data.session_id]
+      delete streamingRespondingMessageIdRef.current[data.session_id]
       setCurrentSession(prev => {
         if (!prev) return prev
         if (prev.id !== data.session_id) return prev
@@ -465,6 +555,13 @@ function App() {
 
     // 被终止
     socket.on('killed', (data: { session_id: string }) => {
+      const messageId = streamingRespondingMessageIdRef.current[data.session_id]
+      if (messageId) {
+        setDisplayQueue('')
+        setDisplayMessageId((prev) => (prev === messageId ? null : prev))
+      }
+      delete activeRespondingMessageIdRef.current[data.session_id]
+      delete streamingRespondingMessageIdRef.current[data.session_id]
       setCurrentSession(prev => {
         if (!prev) return prev
         if (prev.id !== data.session_id) return prev
@@ -474,6 +571,10 @@ function App() {
     })
 
     return () => {
+      if (typingTimeoutRef.current !== null) {
+        window.clearTimeout(typingTimeoutRef.current)
+        typingTimeoutRef.current = null
+      }
       socket.off('connect')
       socket.off('disconnect')
       socket.off('connect_error')

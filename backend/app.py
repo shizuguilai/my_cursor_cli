@@ -440,20 +440,23 @@ def on_execute(data):
         try:
             sess_id = evt.get('session_id', session_id)
             content = evt.get('content', '')
+            delta = evt.get('delta', '')
             print(f'[Execute] on_progress called: session={sess_id} type={evt.get("type")} content={repr(content[:100])}')
             socketio.emit('output', {
                 'session_id': sess_id,
                 'type': evt.get('type', 'responding'),
                 'content': content,
+                'delta': delta,
                 'snippet': evt.get('snippet', ''),
                 'elapsed': evt.get('elapsed', 0),
                 'request_id': request_id,
             }, room=sid)
-            if content:
+            persisted_content = delta if isinstance(delta, str) and delta else content
+            if persisted_content:
                 session_store.add_message(
                     sess_id,
                     evt.get('type', 'responding'),
-                    content,
+                    persisted_content,
                     snippet=evt.get('snippet', ''),
                     elapsed=evt.get('elapsed', 0),
                 )

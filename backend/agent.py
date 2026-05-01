@@ -22,6 +22,9 @@ PROGRESS_INTERVAL = 2  # 秒
 # 全局活跃任务
 active_agents: Dict[str, 'AgentProcess'] = {}
 _active_lock = threading.Lock()
+# 记录每个 session 已发送给前端的完整响应文本
+# 用于在流式事件中稳定计算可安全追加的 delta，避免重复与回退累积错误
+sent_assistant_content: Dict[str, str] = {}
 
 # 诊断日志文件
 DIAG_LOG = '/tmp/agent_diag.log'
@@ -297,6 +300,7 @@ def execute(
                         continue
 
                     # 确定阶段
+                    delta = ''
                     if ev_type == 'thinking':
                         phase = 'thinking'
                     elif ev_type == 'assistant':
@@ -308,9 +312,29 @@ def execute(
                                 text = c.get('text', '')
                                 if text:
                                     content_parts.append(text)
-                                    assistant_buf += text
                                     last_segment = text
                         content = ''.join(content_parts)
+                        prev_full = sent_assistant_content.get(session_id_from_cli, '')
+
+                        if content.startswith(prev_full):
+                            # 累积模式（最常见）：本次 content 是到当前为止的全量
+                            delta = content[len(prev_full):]
+                            assistant_buf = content
+                            sent_assistant_content[session_id_from_cli] = assistant_buf
+                        elif prev_full.endswith(content):
+                            # 分片模式：本次 content 是新增片段
+                            delta = content
+                            assistant_buf = prev_full + content
+                            sent_assistant_content[session_id_from_cli] = assistant_buf
+                        else:
+                            # 非追加更新（如内容缩短/覆写）前端目前不支持回滚替换，
+                            # 为避免错误累积，只更新基准，不发送错误 delta。
+                            delta = ''
+                            assistant_buf = prev_full
+                            _diag(
+                                f'assistant non-append update ignored: '
+                                f'prev_len={len(prev_full)} cur_len={len(content)}'
+                            )
                     elif ev_type == 'tool_call':
                         phase = 'tool_call'
                         tool_call = ev.get('tool_call', {})
@@ -322,6 +346,7 @@ def execute(
                         if isinstance(tool_call, dict):
                             tool_name = list(tool_call.keys())[0] if tool_call else ''
                         content = f"[工具调用] {tool_name}" if tool_name else "[工具调用]"
+                        delta = content
                     else:
                         content = ''
 
@@ -337,6 +362,7 @@ def execute(
                                 'session_id': session_id_from_cli,
                                 'type': phase,
                                 'content': content,
+                                'delta': delta,
                                 'snippet': snippet,
                                 'elapsed': elapsed,
                             })
@@ -380,6 +406,7 @@ def execute(
             _diag('read_stdout exiting')
             # 进程结束
             agent.done = True
+            sent_assistant_content.pop(session_id_from_cli, None)
             with _active_lock:
                 if session_id in active_agents:
                     del active_agents[session_id]
