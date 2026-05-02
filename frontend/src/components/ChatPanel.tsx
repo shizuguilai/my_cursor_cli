@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, type KeyboardEvent, type RefObject } from 'react'
+import { useState, useRef, type KeyboardEvent, type RefObject } from 'react'
 import { Send, Square, Loader2 } from 'lucide-react'
 import type { SessionDetail } from '../App'
 
@@ -49,9 +49,11 @@ export default function ChatPanel({ session, onSend, onKill, messagesEndRef }: P
           </div>
         )}
 
-        {session.messages.map((msg) => (
-          <MessageBubble key={msg.id} message={msg} />
-        ))}
+        {session.messages.map((msg, idx) => {
+          const isLast = idx === session.messages.length - 1
+          const isStreaming = !!session.is_running && isLast && msg.type === 'responding'
+          return <MessageBubble key={msg.id} message={msg} isStreaming={isStreaming} />
+        })}
 
         {session.error && (
           <div className="rounded p-3 bg-red-900/30 border border-red-800 text-red-300 text-sm font-mono">
@@ -118,35 +120,30 @@ export default function ChatPanel({ session, onSend, onKill, messagesEndRef }: P
   )
 }
 
-function MessageBubble({ message }: { message: SessionDetail['messages'][0] }) {
-  const respondingContentRef = useRef<HTMLDivElement | null>(null)
-
-  useEffect(() => {
-    if (message.type !== 'responding') return
-    const el = respondingContentRef.current
-    if (!el) return
-    // 防覆盖：DOM 直写模式下（data-dom-typed=1）React re-render 不应回写旧 state 内容。
-    if (el.getAttribute('data-dom-typed') === '1') return
-    el.textContent = message.content || message.snippet || '...'
-  }, [message.type, message.id, message.content, message.snippet])
-
+function MessageBubble({ message, isStreaming }: { message: SessionDetail['messages'][0]; isStreaming: boolean }) {
   const typeStyles: Record<string, string> = {
+    user: 'border-l-2 border-[#5b9bd5] bg-[#2d2d30]',
     thinking: 'border-l-2 border-yellow-600 bg-yellow-900/10',
     tool_call: 'border-l-2 border-blue-600 bg-blue-900/10',
     responding: 'border-l-2 border-green-600 bg-transparent',
   }
 
   const typeLabels: Record<string, string> = {
+    user: '🧑 你',
     thinking: '🤔 思考中',
     tool_call: '🔧 工具调用',
     responding: '💬 回复',
   }
 
   const typeColors: Record<string, string> = {
+    user: 'text-[#9cdcfe]',
     thinking: 'text-yellow-400',
     tool_call: 'text-blue-400',
     responding: 'text-green-400',
   }
+
+  const hasContent = !!message.content
+  const displayContent = hasContent ? message.content : (message.snippet || (isStreaming ? '' : '...'))
 
   return (
     <div className={`rounded p-3 ${typeStyles[message.type] || ''}`} data-message-id={message.id}>
@@ -158,18 +155,15 @@ function MessageBubble({ message }: { message: SessionDetail['messages'][0] }) {
           <span className="text-xs text-[#858585]">{formatElapsed(message.elapsed)}</span>
         )}
       </div>
-      {message.type === 'responding' ? (
-        <div
-          ref={respondingContentRef}
-          className="text-sm text-[#d4d4d4] font-mono whitespace-pre-wrap break-words"
-          data-message-content-id={message.id}
-          suppressHydrationWarning
-        />
-      ) : (
-        <div className="text-sm text-[#d4d4d4] font-mono whitespace-pre-wrap break-words">
-          {message.content || message.snippet || '...'}
-        </div>
-      )}
+      <div
+        className="text-sm text-[#d4d4d4] font-mono whitespace-pre-wrap break-words"
+        data-message-content-id={message.id}
+      >
+        {displayContent}
+        {isStreaming && (
+          <span className="inline-block w-[7px] h-[1em] ml-0.5 align-text-bottom bg-green-400 animate-pulse" aria-hidden />
+        )}
+      </div>
     </div>
   )
 }

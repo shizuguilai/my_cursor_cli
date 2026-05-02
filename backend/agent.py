@@ -215,6 +215,52 @@ def execute(
     with _active_lock:
         active_agents[session_id] = agent
 
+    # 任意退出路径只通知一次 on_done/on_error，避免子进程无 result 行就 EOF 时前端一直「执行中」
+    notify_state = {'sent': False}
+
+    def safe_done(result: str, tool_summary: Optional[List[str]] = None):
+        if notify_state['sent']:
+            return
+        notify_state['sent'] = True
+        if on_done:
+            try:
+                on_done({
+                    'session_id': session_id,
+                    'result': result or '',
+                    'tool_summary': list(tool_summary) if tool_summary is not None else [],
+                })
+            except Exception as e:
+                _diag(f'safe_done exception: {e}')
+
+    def safe_err(msg: str):
+        if notify_state['sent']:
+            return
+        notify_state['sent'] = True
+        if on_error:
+            try:
+                on_error(msg)
+            except Exception as e:
+                _diag(f'safe_err exception: {e}')
+
+    # 汇总 agent 子进程 stderr，便于无 result 退出时在错误里直接展示真实原因（如 TLS/代理）
+    stderr_tail_lock = threading.Lock()
+    stderr_fragments: List[str] = []
+
+    def append_agent_stderr(part: str):
+        if not part:
+            return
+        with stderr_tail_lock:
+            stderr_fragments.append(part)
+            joined = ''.join(stderr_fragments)
+            if len(joined) > 16000:
+                stderr_fragments.clear()
+                stderr_fragments.append(joined[-8000:])
+
+    def get_agent_stderr_tail(max_chars: int = 4000) -> str:
+        with stderr_tail_lock:
+            s = ''.join(stderr_fragments).strip()
+            return s[-max_chars:] if len(s) > max_chars else s
+
     _diag(f'Subprocess started pid={pid} session={session_id} stdout_fileno={process.stdout.fileno()} stderr_fileno={process.stderr.fileno()}')
 
     # 用 select 配合 readline 实现高效读取，避免逐字节 read(1) 的低效问题
@@ -240,8 +286,7 @@ def execute(
                 if time.time() > timeout_timer:
                     _diag(f'TIMEOUT ({timeout}s) session={session_id}')
                     agent.kill()
-                    if on_error:
-                        on_error(f"Agent 运行超时 ({timeout // 60}分钟),已强制终止")
+                    safe_err(f"Agent 运行超时 ({timeout // 60}分钟),已强制终止")
                     break
 
                 # 使用 select.select 等待数据（eventlet 下 poll 不可用，用 select 代替）
@@ -257,8 +302,10 @@ def execute(
                     if idle_time > 300 and not agent.done:
                         _diag(f'{idle_time/60:.0f}分钟无输出,强制终止 session={session_id}')
                         agent.kill()
-                        if on_error:
-                            on_error(f"任务 {idle_time/60:.0f}分钟无响应,已强制终止。可能原因:等待外部服务响应、陷入死循环或卡在用户输入")
+                        safe_err(
+                            f"任务 {idle_time/60:.0f}分钟无响应,已强制终止。"
+                            "可能原因:等待外部服务响应、陷入死循环或卡在用户输入"
+                        )
                     continue
 
                 # 有数据可读，尝试读一行
@@ -316,25 +363,27 @@ def execute(
                         content = ''.join(content_parts)
                         prev_full = sent_assistant_content.get(session_id_from_cli, '')
 
-                        if content.startswith(prev_full):
-                            # 累积模式（最常见）：本次 content 是到当前为止的全量
+                        if not content:
+                            # 空 content：跳过
+                            delta = ''
+                            assistant_buf = prev_full
+                        elif content == prev_full and len(content) >= 2:
+                            # 完整重发（流式输出结束后 CLI 会再发一次「全量 assistant」事件）：跳过
+                            # 注意只在 len>=2 时去重，避免吞掉 'a'+'a' 这种连续单字
+                            delta = ''
+                            assistant_buf = prev_full
+                        elif len(content) > len(prev_full) and content.startswith(prev_full):
+                            # 累积模式：本次比上次长且以上次为前缀 → 多出来的尾部是新增
                             delta = content[len(prev_full):]
                             assistant_buf = content
                             sent_assistant_content[session_id_from_cli] = assistant_buf
-                        elif prev_full.endswith(content):
-                            # 分片模式：本次 content 是新增片段
+                        else:
+                            # 分片模式：每条事件就是一段新增 token，直接追加
+                            # 不能按 prev_full.endswith(content) 去重，否则会吞掉
+                            # 像 “轻轻” 这种合法的连续相同字符片段。
                             delta = content
                             assistant_buf = prev_full + content
                             sent_assistant_content[session_id_from_cli] = assistant_buf
-                        else:
-                            # 非追加更新（如内容缩短/覆写）前端目前不支持回滚替换，
-                            # 为避免错误累积，只更新基准，不发送错误 delta。
-                            delta = ''
-                            assistant_buf = prev_full
-                            _diag(
-                                f'assistant non-append update ignored: '
-                                f'prev_len={len(prev_full)} cur_len={len(content)}'
-                            )
                     elif ev_type == 'tool_call':
                         phase = 'tool_call'
                         tool_call = ev.get('tool_call', {})
@@ -359,7 +408,7 @@ def execute(
                         snippet = '\n'.join(lines[-4:]) if lines else ''
                         try:
                             on_progress({
-                                'session_id': session_id_from_cli,
+                                'session_id': session_id,
                                 'type': phase,
                                 'content': content,
                                 'delta': delta,
@@ -380,28 +429,18 @@ def execute(
                             result_text = str(result_text)
 
                         if ev.get('subtype') == 'error':
-                            if on_error:
-                                on_error(result_text)
+                            safe_err(result_text or 'Agent 返回错误')
                         else:
                             final_output = result_text or last_segment.strip() or assistant_buf.strip()
-                            if on_done:
-                                try:
-                                    on_done({
-                                        'session_id': session_id_from_cli,
-                                        'result': final_output,
-                                        'tool_summary': tool_summary,
-                                    })
-                                    _diag('on_done called OK')
-                                except Exception as e:
-                                    _diag(f'on_done exception: {e}')
+                            safe_done(final_output, tool_summary)
+                            _diag('on_done called OK')
                         agent.done = True
                         break
 
         except Exception as e:
             _diag(f'stdout 读取异常: {e}')
             agent.kill()
-            if on_error:
-                on_error(str(e))
+            safe_err(str(e))
         finally:
             _diag('read_stdout exiting')
             # 进程结束
@@ -410,6 +449,29 @@ def execute(
             with _active_lock:
                 if session_id in active_agents:
                     del active_agents[session_id]
+
+            # 子进程在从未输出 type=result 的行就退出时，必须补发 done/error，否则前端一直「执行中」
+            if not notify_state['sent']:
+                if agent.manually_killed:
+                    safe_done(assistant_buf.strip())
+                elif assistant_buf.strip():
+                    safe_done(assistant_buf.strip(), tool_summary)
+                else:
+                    tail = get_agent_stderr_tail()
+                    if tail:
+                        safe_err(
+                            'Agent 已退出，未收到 result 结束事件。子进程 stderr 如下：\n\n'
+                            + tail
+                            + '\n\n'
+                            '常见处理：若出现 TLS/代理相关报错，请检查 http(s)_proxy 指向的代理(如 127.0.0.1:7890)是否可用，'
+                            '或在启动后端的 systemd/screen 环境中 unset HTTP_PROXY/HTTPS_PROXY/all_proxy 后重试；'
+                            '并确认已登录 Cursor CLI 或已配置 CURSOR_API_KEY。完整诊断见 /tmp/agent_diag.log'
+                        )
+                    else:
+                        safe_err(
+                            'Agent 已退出，未收到 result 结束事件，且无 stderr 捕获（请查看 /tmp/agent_diag.log）。'
+                            '常见原因：网络/TLS、代理、CURSOR_API_KEY 或 agent CLI 异常。'
+                        )
 
             # 确保进程已终止
             try:
@@ -437,10 +499,12 @@ def execute(
                 if stderr_data:
                     stderr_text = stderr_data.decode('utf-8', errors='replace').strip()
                     _diag(f'Early exit stderr: {stderr_text[:500]}')
-                    if on_error and stderr_text:
-                        on_error(stderr_text)
+                    safe_err(stderr_text if stderr_text else f'Agent 进程已退出 (code={poll_result})')
+                else:
+                    safe_err(f'Agent 进程已退出 (code={poll_result})，且无 stderr 输出')
             except Exception as e:
                 _diag(f'read early stderr failed: {e}')
+                safe_err(f'Agent 进程已退出 (code={poll_result})，读取 stderr 失败: {e}')
             agent.done = True
 
     early_check_thread = threading.Thread(target=check_early_exit, daemon=True)
@@ -465,6 +529,7 @@ def execute(
                             for line in remaining.decode('utf-8', errors='replace').split('\n'):
                                 if line.strip():
                                     _diag(f'[stderr] {line}')
+                                    append_agent_stderr(line + '\n')
                         break
                     continue
                 try:
@@ -477,10 +542,14 @@ def execute(
                 # 按行输出
                 while b'\n' in buf:
                     line, buf = buf.split(b'\n', 1)
-                    _diag(f'[stderr] {line.decode("utf-8", errors="replace")}')
+                    dec = line.decode('utf-8', errors='replace')
+                    _diag(f'[stderr] {dec}')
+                    append_agent_stderr(dec + '\n')
                 # 处理最后没有换行符的
                 if buf:
-                    _diag(f'[stderr] {buf.decode("utf-8", errors="replace")}')
+                    dec = buf.decode('utf-8', errors='replace')
+                    _diag(f'[stderr] {dec}')
+                    append_agent_stderr(dec + '\n')
         except Exception as e:
             _diag(f'read_stderr exception: {e}')
         finally:
