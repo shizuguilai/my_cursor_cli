@@ -1,6 +1,7 @@
 import type { Components } from 'react-markdown'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { normalizePrismLanguage, prismCodeStyle, SyntaxHighlighter } from '../lib/prismSetup'
 
 type Props = {
   /** 原始 Markdown 文本 */
@@ -142,21 +143,34 @@ const markdownComponents: Components = {
     }
     return <input type={type} {...props} />
   },
-  pre: ({ children, ...props }) => (
-    <pre
-      className="my-3 overflow-x-auto rounded border border-[#3c3c3c] bg-[#1a1a1a] p-3 font-mono text-xs leading-relaxed text-[#d4d4d4]"
-      {...props}
-    >
-      {children}
-    </pre>
-  ),
+  /** 避免与 SyntaxHighlighter 的 PreTag 套双层 <pre> */
+  pre: ({ children }) => <>{children}</>,
   code: ({ className, children, ...props }) => {
-    const isBlock = Boolean(className?.startsWith('language-'))
+    const text = String(children).replace(/\n$/, '')
+    const fence = /language-([\w+#.-]+)/.exec(className ?? '')
+    const explicitFence = Boolean(fence?.[1])
+    const isBlock = explicitFence || text.includes('\n')
+
     if (isBlock) {
+      const lang = explicitFence ? normalizePrismLanguage(fence![1]!) : 'markup'
       return (
-        <code className={`block font-mono ${className || ''}`} {...props}>
-          {children}
-        </code>
+        <SyntaxHighlighter
+          language={lang}
+          style={prismCodeStyle}
+          PreTag="div"
+          className="markdown-syntax-block font-mono"
+          customStyle={{
+            margin: '0.75rem 0',
+            padding: '0.75rem',
+            borderRadius: '0.375rem',
+            border: '1px solid #d0d7de',
+            background: '#ffffff',
+            fontSize: '0.75rem',
+            lineHeight: 1.625,
+          }}
+        >
+          {text}
+        </SyntaxHighlighter>
       )
     }
     return (

@@ -116,13 +116,30 @@
   line-height: 1.5;
 }
 
-.markdown-body :not(pre) > code {
+/*
+ * 仅行内 `code`：围栏块是 div>code 且带 language-*，不能用 :not(pre)>code 误匹配，
+ * 否则整块会被套上 #3c3c3c，在深色/白底上像文字背后有一层灰白。
+ */
+.markdown-body :not(pre) > code:not([class*='language-']) {
   padding: 0.1rem 0.35rem;
   border-radius: 0.2rem;
   background: #3c3c3c;
   color: #ce9178;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.85em;
+}
+
+/*
+ * oneLight 给 code 默认 hsl(230,1%,98%)、部分 token 带极淡灰底，叠在 #fff 外框上会像字背后一层灰。
+ */
+.markdown-body .markdown-syntax-block code[class*='language-'] {
+  background: #fff !important;
+  background-color: #fff !important;
+}
+
+.markdown-body .markdown-syntax-block span[class*='token'] {
+  background: transparent !important;
+  background-color: transparent !important;
 }
 
 .markdown-body table {
