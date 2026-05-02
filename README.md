@@ -19,6 +19,19 @@
                                               └─────────────────────┘
 ```
 
+## 当前功能一览
+
+| 模块 | 能力 |
+|------|------|
+| **鉴权** | 固定 Token（`CURSOR_REMOTE_TOKEN` / `AUTH_TOKEN`）；前端 `localStorage` 持久化；`/api/*` 与 Socket.IO 均需携带 token |
+| **工作区** | 读取 `projects.json`；列表、添加、删除、设置默认；路径校验 |
+| **会话** | SQLite 持久化（`backend/sessions.sqlite3`）；列表、详情、删除、重命名（PATCH）；新建后由模型生成简短中文标题 |
+| **执行** | Socket.IO `execute`：在选定工作区目录下拉起 Cursor Agent；流式事件 `thinking` / `tool_call` / `responding` / `done` / `error` / `killed` |
+| **聊天 UI** | 左侧会话列表 + 可折叠侧栏；右侧消息流；执行中可 `kill` 终止；流式回复末尾闪烁光标 |
+| **Markdown** | 用户消息、回复、思考、工具摘要等使用 **GFM**（表格、任务列表、删除线等）渲染 |
+| **代码高亮** | 围栏代码块：`react-syntax-highlighter`（Prism 按需语言）+ **oneLight** 主题；白底容器；行内 `` `code` `` 仍为小灰底标签样式 |
+| **静态资源** | `npm run build` 产物直接输出到 `backend/static/`（Vite `outDir` + `emptyOutDir`）；`/` 的 `index.html` **禁用强缓存**；`/assets/*` 下带 hash 的 js/css **长期缓存** |
+
 ## 快速启动
 
 ### 后端
@@ -51,23 +64,16 @@ npm install
 npm run dev
 ```
 
-访问 http://localhost:5173
+开发时访问 http://localhost:5173（Vite 已将 `/api` 与 `/socket.io` 代理到后端，默认 `http://localhost:5000`）。
 
-### 构建前端
+### 构建前端（与后端一并部署）
 
 ```bash
 cd frontend
 npm run build
-# 产物自动复制到 backend/static/
 ```
 
-## 功能
-
-- ✅ 多工作区管理（projects.json）
-- ✅ 实时流式输出（thinking / tool_call / responding）
-- ✅ 会话管理（新建 / 恢复 / 终止）
-- ✅ WebSocket 双向通信
-- ✅ 深色主题（Cursor IDE 风格）
+构建产物写入 **`backend/static/`**，无需再手动拷贝 `dist`。部署或本地联调时：先 build，再启动 Flask，浏览器打开后端根路径即可。
 
 ## 配置
 
@@ -114,6 +120,14 @@ npm run build
 
 ## 技术栈
 
-- 前端：React 18 + TypeScript + Vite + TailwindCSS + Socket.IO Client
-- 后端：Python 3.12 + Flask + Flask-SocketIO
-- 执行层：Cursor Agent CLI (`/root/.local/bin/agent`)
+- 前端：React 19 + TypeScript + Vite + Tailwind CSS 4 + Socket.IO Client + react-markdown（remark-gfm）+ react-syntax-highlighter（Prism）
+- 后端：Python 3 + Flask + Flask-SocketIO（eventlet）
+- 会话存储：SQLite（`session_store`）
+- 执行层：Cursor Agent CLI（`AGENT_BIN`，默认如 `/root/.local/bin/agent`）
+
+## REST / Socket 速查
+
+- **HTTP**：`/api/health`、`/api/auth/check`、`/api/projects`、`/api/projects/<name>`、`/api/projects/default/<name>`、`/api/sessions`、`/api/sessions/<id>`（GET/PATCH/DELETE）
+- **Socket.IO**：`execute`（payload 含会话、工作区、模型、用户输入等）、`kill`（终止指定会话任务）
+
+更细的接口与事件字段见 `backend/app.py` 与 `frontend/src/App.tsx`。
