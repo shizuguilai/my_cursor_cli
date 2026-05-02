@@ -11,7 +11,7 @@ import time
 import subprocess
 from datetime import datetime
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, make_response
 from flask_socketio import SocketIO, emit, disconnect
 
 # 添加 backend 目录到 path
@@ -153,16 +153,29 @@ def _generate_session_name(workspace: str, user_prompt: str, model: str) -> str:
 
 @app.route('/')
 def index():
-    return send_from_directory(STATIC_DIR, 'index.html')
+    """入口 HTML 禁止强缓存，否则浏览器会一直用旧的 index 里指向的旧 hash JS。"""
+    resp = make_response(send_from_directory(STATIC_DIR, 'index.html'))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    return resp
 
 
 @app.route('/static/<path:filename>')
 def serve_static(filename):
-    return send_from_directory(os.path.join(app.root_path, 'static'), filename)
+    resp = make_response(send_from_directory(os.path.join(app.root_path, 'static'), filename))
+    resp.headers['Cache-Control'] = 'public, max-age=3600'
+    return resp
+
 
 @app.route('/assets/<path:filename>')
 def serve_assets(filename):
-    return send_from_directory(os.path.join(app.root_path, 'static', 'assets'), filename)
+    """Vite 产物文件名带 content-hash，可长期缓存；换版本靠 index.html 指向新文件名。"""
+    resp = make_response(send_from_directory(os.path.join(app.root_path, 'static', 'assets'), filename))
+    if filename.endswith(('.js', '.css', '.woff2')):
+        resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    else:
+        resp.headers['Cache-Control'] = 'no-cache'
+    return resp
 
 
 # ===== REST API =====

@@ -1,6 +1,7 @@
 import { useState, useRef, type KeyboardEvent, type RefObject } from 'react'
 import { Send, Square, Loader2 } from 'lucide-react'
 import type { SessionDetail } from '../App'
+import MarkdownBody from './MarkdownBody'
 
 interface Props {
   session: SessionDetail | null
@@ -144,6 +145,12 @@ function MessageBubble({ message, isStreaming }: { message: SessionDetail['messa
 
   const hasContent = !!message.content
   const displayContent = hasContent ? message.content : (message.snippet || (isStreaming ? '' : '...'))
+  // Cursor 侧流式输出多为 Markdown：正式回复 + 思考过程 + 工具摘要一并渲染
+  const useMarkdown =
+    message.type === 'responding' ||
+    message.type === 'user' ||
+    message.type === 'thinking' ||
+    message.type === 'tool_call'
 
   return (
     <div className={`rounded p-3 ${typeStyles[message.type] || ''}`} data-message-id={message.id}>
@@ -155,13 +162,27 @@ function MessageBubble({ message, isStreaming }: { message: SessionDetail['messa
           <span className="text-xs text-[#858585]">{formatElapsed(message.elapsed)}</span>
         )}
       </div>
-      <div
-        className="text-sm text-[#d4d4d4] font-mono whitespace-pre-wrap break-words"
-        data-message-content-id={message.id}
-      >
-        {displayContent}
-        {isStreaming && (
-          <span className="inline-block w-[7px] h-[1em] ml-0.5 align-text-bottom bg-green-400 animate-pulse" aria-hidden />
+      <div className="break-words" data-message-content-id={message.id}>
+        {useMarkdown ? (
+          <div className="w-full min-w-0 max-w-full">
+            {displayContent ? <MarkdownBody content={displayContent} /> : null}
+            {isStreaming && (
+              <span
+                className="inline-block w-[7px] h-[1em] ml-0.5 align-text-bottom bg-green-400 animate-pulse"
+                aria-hidden
+              />
+            )}
+          </div>
+        ) : (
+          <div className="text-sm text-[#d4d4d4] font-mono whitespace-pre-wrap">
+            {displayContent}
+            {isStreaming && (
+              <span
+                className="inline-block w-[7px] h-[1em] ml-0.5 align-text-bottom bg-green-400 animate-pulse"
+                aria-hidden
+              />
+            )}
+          </div>
         )}
       </div>
     </div>
